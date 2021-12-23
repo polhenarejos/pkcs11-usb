@@ -6,11 +6,10 @@ endif(COMMAND cmake_policy)
 
 project (pkcs11 C)
 
-set(PKCS11_PROXY_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c egg-buffer.c gck-rpc-tls-psk.c)
-set(PKCS11_DAEMON_SRCS egg-buffer.c gck-rpc-daemon-standalone.c gck-rpc-dispatch.c gck-rpc-message.c gck-rpc-util.c syscall-reporter.c syscall-names.h gck-rpc-tls-psk.c)
+set(PKCS11_USB_SRCS gck-rpc-module.c gck-rpc-message.c gck-rpc-util.c egg-buffer.c gck-rpc-tls-psk.c)
 
 add_definitions(-Wall)
-add_library(pkcs11-proxy SHARED ${PKCS11_PROXY_SRCS})
+add_library(pkcs11-usb SHARED ${PKCS11_USB_SRCS})
 
 # Disable console when building Win32 binary in release mode
 if (WIN32)
@@ -19,9 +18,34 @@ if (WIN32)
   endif()
 endif()
 
-add_executable (pkcs11-daemon ${GUI_TYPE} ${PKCS11_DAEMON_SRCS})
+find_package(PkgConfig)
+pkg_check_modules(PC_LIBPCSC libpcsclite)
+set(PCSC_DEFINITIONS ${PC_LIBPCSC_CFLAGS_OTHER})
 
-set_target_properties(pkcs11-proxy PROPERTIES VERSION 0.1 SOVERSION 0)
+find_path(LIBPCSC_INCLUDE_DIR winscard.h
+          HINTS ${PC_LIBPCSC_INCLUDEDIR} ${PC_LIBPCSC_INCLUDE_DIRS}
+          PATH_SUFFIXES PCSC )
+          
+find_library(LIBPCSC_LIBRARY NAMES pcsclite
+             HINTS ${PC_LIBPCSC_LIBDIR} ${PC_LIBPCSC_LIBRARY_DIRS} )
+
+include(FindPackageHandleStandardArgs)
+# handle the QUIETLY and REQUIRED arguments and set LIBPCSC_FOUND to TRUE
+# if all listed variables are TRUE
+find_package_handle_standard_args(LIBPCSC  DEFAULT_MSG
+                                  LIBPCSC_LIBRARY LIBPCSC_INCLUDE_DIR)
+mark_as_advanced(LIBPCSC_INCLUDE_DIR LIBPCSC_LIBRARY )
+
+set(LIBPCSC_LIBRARIES ${LIBPCSC_LIBRARY} )
+set(LIBPCSC_INCLUDE_DIRS ${LIBPCSC_INCLUDE_DIR} )
+
+if (LIBPCSC_FOUND)
+  include_directories(${LIBPCSC_INCLUDE_DIRS})
+  message(STATUS "PCSC include dir='${LIBPCSC_INCLUDE_DIRS}'")
+  target_link_libraries (pkcs11-usb ${LIBPCSC_LIBRARIES})
+endif (LIBPCSC_FOUND)
+
+set_target_properties(pkcs11-usb PROPERTIES VERSION 0.1 SOVERSION 0)
 
 if (WIN32)
   include_directories("ext/include")
@@ -29,15 +53,12 @@ if (WIN32)
   add_library(dl STATIC IMPORTED)
   set_property(TARGET dl PROPERTY
                IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/ext/lib/libdl.a)
-  target_link_libraries (pkcs11-daemon ws2_32)
-  target_link_libraries (pkcs11-proxy ws2_32)
+  target_link_libraries (pkcs11-usb ws2_32)
 endif (WIN32)
 
-target_link_libraries (pkcs11-proxy pthread ssl crypto)
-target_link_libraries (pkcs11-daemon dl pthread ssl crypto seccomp)
+target_link_libraries (pkcs11-usb pthread ssl crypto)
 
-install_targets (/lib pkcs11-proxy)
-install_targets (/bin pkcs11-daemon)
+install_targets (/lib pkcs11-usb)
 
 add_custom_command(
    OUTPUT syscall-names.h 
