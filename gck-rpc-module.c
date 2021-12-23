@@ -54,6 +54,34 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef WIN32
+#undef UNICODE
+#endif
+
+#ifdef __APPLE__
+#include <PCSC/winscard.h>
+#include <PCSC/wintypes.h>
+#else
+#include <winscard.h>
+#endif
+
+#ifdef WIN32
+static char *pcsc_stringify_error(LONG rv)
+{
+ static char out[20];
+ sprintf_s(out, sizeof(out), "0x%08X", rv);
+
+ return out;
+}
+#endif
+
+#define CHECK(f, rv) \
+ if (SCARD_S_SUCCESS != rv) \
+ { \
+  printf(f ": %s\n", pcsc_stringify_error(rv)); \
+  return -1; \
+ }
+
 /* -------------------------------------------------------------------
  * GLOBALS / DEFINES
  */
@@ -208,6 +236,10 @@ typedef struct _CallState {
 	int call_status;
 	GckRpcTlsPskState *tls;
 	struct _CallState *next;	/* For pooling of completed sockets */
+	int socket_type; /* 0 -> sock (tcp/nix), 1 -> usb */
+	SCARD_IO_REQUEST pioSendPci;
+  SCARDCONTEXT hContext;
+  LPTSTR mszReaders;
 } CallState;
 
 /* Maximum number of idle calls */
@@ -229,21 +261,37 @@ static void *call_allocator(void *p, size_t sz)
 	return res;
 }
 
-static void call_disconnect(CallState * cs)
+static CK_RV call_disconnect(CallState * cs)
 {
 	assert(cs);
 
 	if (cs->socket != -1) {
 		debug(("disconnected socket"));
-		close(cs->socket);
+		if (cs->socket_type == 1) {
+		  LONG rv = SCardDisconnect((SCARDHANDLE)cs->socket, SCARD_LEAVE_CARD);
+      CHECK("SCardDisconnect", rv)
+#ifdef SCARD_AUTOALLOCATE
+      rv = SCardFreeMemory(cs->hContext, cs->mszReaders);
+      CHECK("SCardFreeMemory", rv)
+      
+#else
+      free(cs->mszReaders);
+#endif
+      rv = SCardReleaseContext(cs->hContext);
+      
+      CHECK("SCardReleaseContext", rv)
+		}
+		else 
+		  close(cs->socket);
 		cs->socket = -1;
 	}
+	return CKR_OK;
 }
 
 /* Write all data to session socket.  */
-static CK_RV call_write(CallState * cs, unsigned char *data, size_t len)
+static CK_RV call_write(CallState * cs, unsigned char *data, size_t len, EggBuffer *out, size_t *outlen)
 {
-	int fd, r;
+	int fd, r = 0;
 
 	assert(cs);
 	assert(data);
@@ -259,11 +307,31 @@ static CK_RV call_write(CallState * cs, unsigned char *data, size_t len)
 
 		if (cs->tls)
 			r = gck_rpc_tls_write_all(cs->tls, (void *) data, len);
-		else
-			r = send(fd, (void *) data, len, 0);
-
-		if (r == -1) {
-			if (errno == EPIPE) {
+	  else if (cs->socket_type == 1) {
+	    BYTE pbRecvBuffer[2048];
+	    LONG rv;
+	    DWORD dwRecvLength = sizeof(pbRecvBuffer);
+	    //printf("payload: ");
+      //for(int i=0; i<len; i++)
+      //  printf("%02X ", data[i]);
+      //printf("\n");
+      rv = SCardTransmit((SCARDHANDLE)fd, &cs->pioSendPci, data, len, NULL, pbRecvBuffer, &dwRecvLength);
+      CHECK("SCardTransmit", rv)
+      //printf("response: ");
+      //for(int i=0; i<dwRecvLength; i++)
+      //  printf("%02X ", pbRecvBuffer[i]);
+      //printf("\n");
+      r = len;
+      //printf("r = %d\n",r);
+      *outlen = dwRecvLength;
+      if (!egg_buffer_reserve(out, *outlen + out->len)) {
+      	warning(("couldn't allocate %u byte response area: out of memory", *outlen));
+      	return CKR_HOST_MEMORY;
+      }
+      memcpy(out->buf, pbRecvBuffer, sizeof(char)*dwRecvLength);
+    }
+    if (r == -1) {
+      if (errno == EPIPE) {
 				warning(("couldn't send data: daemon closed connection"));
 				call_disconnect(cs);
 				return CKR_DEVICE_ERROR;
@@ -283,6 +351,7 @@ static CK_RV call_write(CallState * cs, unsigned char *data, size_t len)
 }
 
 /* Read a certain amount of data from session socket. */
+/*
 static CK_RV call_read(CallState * cs, unsigned char *data, size_t len)
 {
 	int fd, r;
@@ -323,7 +392,7 @@ static CK_RV call_read(CallState * cs, unsigned char *data, size_t len)
 
 	return CKR_OK;
 }
-
+*/
 static int _connect_to_host_port(char *host, char *port)
 {
 	char hoststr[NI_MAXHOST], portstr[NI_MAXSERV], hostport[NI_MAXHOST + NI_MAXSERV + 1];
@@ -416,12 +485,13 @@ static CK_RV call_connect(CallState * cs)
 	assert(cs->socket == -1);
 	assert(cs->call_status == CALL_INVALID);
 	assert(pkcs11_socket_path[0]);
+	cs->socket_type = 0;
 
 	debug(("connecting to: %s", pkcs11_socket_path));
 
 	memset(&addr, 0, sizeof(addr));
 
-	if (! strncmp("tcp://", pkcs11_socket_path, 6) ||
+	if (! strncmp("tcp://", pkcs11_socket_path, 6) || 
 	    ! strncmp("tls://", pkcs11_socket_path, 6)) {
 		char *host, *port;
 
@@ -455,7 +525,46 @@ static CK_RV call_connect(CallState * cs)
 				return CKR_DEVICE_ERROR;
 			}
 		}
-	} else {
+	} else if (! strncmp("usb://", pkcs11_socket_path, 6) ) {
+	  LONG rv;
+
+    SCARDHANDLE hCard;
+    DWORD dwReaders, dwActiveProtocol;
+
+    rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &cs->hContext);
+    CHECK("SCardEstablishContext", rv)
+    
+#ifdef SCARD_AUTOALLOCATE
+    dwReaders = SCARD_AUTOALLOCATE;
+    
+    rv = SCardListReaders(cs->hContext, NULL, (LPTSTR)&cs->mszReaders, &dwReaders);
+    CHECK("SCardListReaders", rv)
+#else
+    rv = SCardListReaders(cs->hContext, NULL, NULL, &dwReaders);
+    CHECK("SCardListReaders", rv)
+    
+    mszReaders = calloc(dwReaders, sizeof(char));
+    rv = SCardListReaders(cs->hContext, NULL, cs->mszReaders, &dwReaders);
+    CHECK("SCardListReaders", rv)
+#endif
+    printf("reader name: %s\n", cs->mszReaders);
+    
+    rv = SCardConnect(cs->hContext, cs->mszReaders, SCARD_SHARE_SHARED,
+    SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &hCard, &dwActiveProtocol);
+    CHECK("SCardConnect", rv)
+    sock = (int)hCard;
+    cs->socket_type = 1;
+    switch(dwActiveProtocol)
+    {
+      case SCARD_PROTOCOL_T0:
+       cs->pioSendPci = *SCARD_PCI_T0;
+       break;
+      
+      case SCARD_PROTOCOL_T1:
+       cs->pioSendPci = *SCARD_PCI_T1;
+       break;
+    }
+	}else {
 		addr.sun_family = AF_UNIX;
 		strncpy(addr.sun_path, pkcs11_socket_path,
 			sizeof(addr.sun_path));
@@ -488,8 +597,9 @@ static CK_RV call_connect(CallState * cs)
 	cs->call_status = CALL_READY;
 	debug(("connected socket"));
 
-	return call_write(cs, (unsigned char*)&pkcs11_app_id,
-			  sizeof(pkcs11_app_id));
+	//return call_write(cs, (unsigned char*)&pkcs11_app_id,
+	//		  sizeof(pkcs11_app_id));
+	return CKR_OK;
 }
 
 static void call_destroy(void *value)
@@ -588,7 +698,6 @@ static CK_RV call_prepare(CallState * cs, int call_id)
 static CK_RV call_send_recv(CallState * cs)
 {
 	GckRpcMessage *req, *resp;
-	unsigned char buf[4];
 	uint32_t len;
 	CK_RV ret;
 
@@ -620,15 +729,16 @@ static CK_RV call_send_recv(CallState * cs)
 
 	/* Send the number of bytes, and then the data */
 
-	egg_buffer_encode_uint32(buf, req->buffer.len);
-	ret = call_write(cs, buf, 4);
+	//egg_buffer_encode_uint32(buf, req->buffer.len);
+	//ret = call_write(cs, buf, 4);
+	//if (ret != CKR_OK)
+	//	goto cleanup;
+	ret = call_write(cs, req->buffer.buf, req->buffer.len, &resp->buffer, &len);
 	if (ret != CKR_OK)
 		goto cleanup;
-	ret = call_write(cs, req->buffer.buf, req->buffer.len);
-	if (ret != CKR_OK)
-		goto cleanup;
-
+  
 	/* Now read out the number of bytes, and then the data */
+	/*
 	ret = call_read(cs, buf, 4);
 	if (ret != CKR_OK)
 		goto cleanup;
@@ -643,7 +753,7 @@ static CK_RV call_send_recv(CallState * cs)
 	ret = call_read(cs, resp->buffer.buf, len);
 	if (ret != CKR_OK)
 		goto cleanup;
-
+  */
 	egg_buffer_add_empty(&resp->buffer, len);
 	if (!gck_rpc_message_parse(resp, GCK_RPC_RESPONSE))
 		goto cleanup;
@@ -1354,7 +1464,7 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 	if (pkcs11_socket_path[0] == 0) {
 		path = getenv("PKCS11_PROXY_SOCKET");
 		if (path && path[0]) {
-			if ((! strncmp("tcp://", path, 6)) ||
+			if ((! strncmp("tcp://", path, 6)) || (! strncmp("usb://", path, 6)) ||
 			    (! strncmp("tls://", path, 6)))
 				snprintf(pkcs11_socket_path,
 					 sizeof(pkcs11_socket_path), "%s",
@@ -1365,8 +1475,9 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 					 "%s.pkcs11", path);
 			pkcs11_socket_path[sizeof(pkcs11_socket_path) - 1] = 0;
 		} else {
-			ret =  CKR_FUNCTION_NOT_SUPPORTED;
-			goto done;
+			snprintf(pkcs11_socket_path,
+					 sizeof(pkcs11_socket_path), "%s",
+					 "usb://");
 		}
 	}
 
